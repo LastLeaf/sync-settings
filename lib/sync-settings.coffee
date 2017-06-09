@@ -2,7 +2,7 @@
 {BufferedProcess} = require 'atom'
 fs = require 'fs'
 _ = require 'underscore-plus'
-[GitHubApi, PackageManager, Tracker] = []
+[GitHubApi, PackageManager] = []
 ForkGistIdInputView = null
 
 # constants
@@ -10,7 +10,7 @@ DESCRIPTION = 'Atom configuration storage operated by http://atom.io/packages/sy
 REMOVE_KEYS = [
   'sync-settings.gistId',
   'sync-settings.personalAccessToken',
-  'sync-settings._analyticsUserId',
+  'sync-settings._analyticsUserId',  # keep legacy key in blacklist
   'sync-settings._lastBackupHash',
 ]
 
@@ -21,35 +21,25 @@ SyncSettings =
     # speedup activation by async initializing
     setImmediate =>
       # actual initialization after atom has loaded
-      GitHubApi ?= require 'github4'
+      GitHubApi ?= require 'github'
       PackageManager ?= require './package-manager'
-      Tracker ?= require './tracker'
 
       atom.commands.add 'atom-workspace', "sync-settings:backup", =>
         @backup()
-        @tracker.track 'Backup'
       atom.commands.add 'atom-workspace', "sync-settings:restore", =>
         @restore()
-        @tracker.track 'Restore'
       atom.commands.add 'atom-workspace', "sync-settings:view-backup", =>
         @viewBackup()
-        @tracker.track 'View backup'
       atom.commands.add 'atom-workspace', "sync-settings:check-backup", =>
         @checkForUpdate()
-        @tracker.track 'Check backup'
       atom.commands.add 'atom-workspace', "sync-settings:fork", =>
         @inputForkGistId()
 
       mandatorySettingsApplied = @checkMandatorySettings()
       @checkForUpdate() if atom.config.get('sync-settings.checkForUpdatedBackup') and mandatorySettingsApplied
 
-      # make the tracking last in case any exception happens
-      @tracker = new Tracker 'sync-settings._analyticsUserId', 'sync-settings.analytics'
-      @tracker.trackActivate()
-
   deactivate: ->
     @inputView?.destroy()
-    @tracker.trackDeactivate()
 
   serialize: ->
 
@@ -60,7 +50,7 @@ SyncSettings =
     return gistId
 
   getPersonalAccessToken: ->
-    token = atom.config.get 'sync-settings.personalAccessToken'
+    token = process.env.GITHUB_TOKEN or atom.config.get 'sync-settings.personalAccessToken'
     if token
       token = token.trim()
     return token
@@ -81,7 +71,6 @@ SyncSettings =
       @createClient().gists.get
         id: @getGistId()
       , (err, res) =>
-        console.debug(err, res)
         if err
           console.error "error while retrieving the gist. does it exists?", err
           try
@@ -90,6 +79,11 @@ SyncSettings =
           catch SyntaxError
             message = err.message
           atom.notifications.addError "sync-settings: Error retrieving your settings. ("+message+")"
+          return cb?()
+
+        if not res?.history?[0]?.version?
+          console.error "could not interpret result:", res
+          atom.notifications.addError "sync-settings: Error retrieving your settings."
           return cb?()
 
         console.debug("latest backup version #{res.history[0].version}")
@@ -154,7 +148,9 @@ SyncSettings =
     if atom.config.get('sync-settings.syncStyles')
       files["styles.less"] = content: (@fileContent atom.styles.getUserStyleSheetPath()) ? "// styles file (not found)"
     if atom.config.get('sync-settings.syncInit')
-      files["init.coffee"] = content: (@fileContent atom.config.configDirPath + "/init.coffee") ? "# initialization file (not found)"
+      initPath = atom.getUserInitScriptPath()
+      path = require('path')
+      files[path.basename(initPath)] = content: (@fileContent initPath) ? "# initialization file (not found)"
     if atom.config.get('sync-settings.syncSnippets')
       files["snippets.cson"] = content: (@fileContent atom.config.configDirPath + "/snippets.cson") ? "# snippets file (not found)"
 
@@ -175,8 +171,11 @@ SyncSettings =
     , (err, res) ->
       if err
         console.error "error backing up data: "+err.message, err
-        message = JSON.parse(err.message).message
-        message = 'Gist ID Not Found' if message is 'Not Found'
+        try
+          message = JSON.parse(err.message).message
+          message = 'Gist ID Not Found' if message is 'Not Found'
+        catch SyntaxError
+          message = err.message
         atom.notifications.addError "sync-settings: Error backing up your settings. ("+message+")"
       else
         atom.config.set('sync-settings._lastBackupHash', res.history[0].version)
@@ -190,10 +189,25 @@ SyncSettings =
 
   getPackages: ->
     packages = []
-    for own name, info of atom.packages.getLoadedPackages()
-      {name, version, theme} = info.metadata
-      packages.push({name, version, theme})
+    for i, metadata of @_getAvailablePackageMetadataWithoutDuplicates()
+      {name, version, theme, apmInstallSource} = metadata
+      packages.push({name, version, theme, apmInstallSource})
     _.sortBy(packages, 'name')
+
+  _getAvailablePackageMetadataWithoutDuplicates: ->
+    path2metadata = {}
+    package_metadata = atom.packages.getAvailablePackageMetadata()
+    for path, i in atom.packages.getAvailablePackagePaths()
+      path2metadata[fs.realpathSync(path)] = package_metadata[i]
+
+    packages = []
+    for i, pkg_name of atom.packages.getAvailablePackageNames()
+      pkg_path = atom.packages.resolvePackagePath(pkg_name)
+      if path2metadata[pkg_path]
+        packages.push(path2metadata[pkg_path])
+      else
+        console.error('could not correlate package name, path, and metadata')
+    packages
 
   restore: (cb=null) ->
     @createClient().gists.get
@@ -201,8 +215,11 @@ SyncSettings =
     , (err, res) =>
       if err
         console.error "error while retrieving the gist. does it exists?", err
-        message = JSON.parse(err.message).message
-        message = 'Gist ID Not Found' if message is 'Not Found'
+        try
+          message = JSON.parse(err.message).message
+          message = 'Gist ID Not Found' if message is 'Not Found'
+        catch SyntaxError
+          message = err.message
         atom.notifications.addError "sync-settings: Error retrieving your settings. ("+message+")"
         return
 
@@ -217,6 +234,8 @@ SyncSettings =
             if atom.config.get('sync-settings.syncPackages')
               callbackAsync = true
               @installMissingPackages JSON.parse(file.content), cb
+              if atom.config.get('sync-settings.removeObsoletePackage')
+                @removeObsoletePackages JSON.parse(file.content), cb
 
           when 'keymap.cson'
             fs.writeFileSync atom.keymaps.getUserKeymapPath(), file.content if atom.config.get('sync-settings.syncKeymap')
@@ -226,6 +245,9 @@ SyncSettings =
 
           when 'init.coffee'
             fs.writeFileSync atom.config.configDirPath + "/init.coffee", file.content if atom.config.get('sync-settings.syncInit')
+
+          when 'init.js'
+            fs.writeFileSync atom.config.configDirPath + "/init.js", file.content if atom.config.get('sync-settings.syncInit')
 
           when 'snippets.cson'
             fs.writeFileSync atom.config.configDirPath + "/snippets.cson", file.content if atom.config.get('sync-settings.syncSnippets')
@@ -286,15 +308,114 @@ SyncSettings =
         console.debug "config.set #{keyPath[1...]}=#{value}"
         atom.config.set keyPath[1...], value
 
+  removeObsoletePackages: (remaining_packages, cb) ->
+    installed_packages = @getPackages()
+    obsolete_packages = []
+    for pkg in installed_packages
+      keep_installed_package = (p for p in remaining_packages when p.name is pkg.name)
+      if keep_installed_package.length is 0
+        obsolete_packages.push(pkg)
+    if obsolete_packages.length is 0
+      atom.notifications.addInfo "Sync-settings: no packages to remove"
+      return cb?()
+
+    notifications = {}
+    succeeded = []
+    failed = []
+    removeNextPackage = =>
+      if obsolete_packages.length > 0
+        # start removing next package
+        pkg = obsolete_packages.shift()
+        i = succeeded.length + failed.length + Object.keys(notifications).length + 1
+        count = i + obsolete_packages.length
+        notifications[pkg.name] = atom.notifications.addInfo "Sync-settings: removing #{pkg.name} (#{i}/#{count})", {dismissable: true}
+        do (pkg) =>
+          @removePackage pkg, (error) ->
+            # removal of package finished
+            notifications[pkg.name].dismiss()
+            delete notifications[pkg.name]
+            if error?
+              failed.push(pkg.name)
+              atom.notifications.addWarning "Sync-settings: failed to remove #{pkg.name}"
+            else
+              succeeded.push(pkg.name)
+            # trigger next package
+            removeNextPackage()
+      else if Object.keys(notifications).length is 0
+        # last package removal finished
+        if failed.length is 0
+          atom.notifications.addSuccess "Sync-settings: finished removing #{succeeded.length} packages"
+        else
+          failed.sort()
+          failedStr = failed.join(', ')
+          atom.notifications.addWarning "Sync-settings: finished removing packages (#{failed.length} failed: #{failedStr})", {dismissable: true}
+        cb?()
+    # start as many package removal in parallel as desired
+    concurrency = Math.min obsolete_packages.length, 8
+    for i in [0...concurrency]
+      removeNextPackage()
+
+  removePackage: (pack, cb) ->
+    type = if pack.theme then 'theme' else 'package'
+    console.info("Removing #{type} #{pack.name}...")
+    packageManager = new PackageManager()
+    packageManager.uninstall pack, (error) ->
+      if error?
+        console.error("Removing #{type} #{pack.name} failed", error.stack ? error, error.stderr)
+      else
+        console.info("Removing #{type} #{pack.name}")
+      cb?(error)
+
   installMissingPackages: (packages, cb) ->
-    pending=0
+    available_packages = @getPackages()
+    missing_packages = []
     for pkg in packages
-      continue if atom.packages.isPackageLoaded(pkg.name)
-      pending++
-      @installPackage pkg, ->
-        pending--
-        cb?() if pending is 0
-    cb?() if pending is 0
+      available_package = (p for p in available_packages when p.name is pkg.name)
+      if available_package.length is 0
+        # missing if not yet installed
+        missing_packages.push(pkg)
+      else if not(!!pkg.apmInstallSource is !!available_package[0].apmInstallSource)
+        # or installed but with different apm install source
+        missing_packages.push(pkg)
+    if missing_packages.length is 0
+      atom.notifications.addInfo "Sync-settings: no packages to install"
+      return cb?()
+
+    notifications = {}
+    succeeded = []
+    failed = []
+    installNextPackage = =>
+      if missing_packages.length > 0
+        # start installing next package
+        pkg = missing_packages.shift()
+        i = succeeded.length + failed.length + Object.keys(notifications).length + 1
+        count = i + missing_packages.length
+        notifications[pkg.name] = atom.notifications.addInfo "Sync-settings: installing #{pkg.name} (#{i}/#{count})", {dismissable: true}
+        do (pkg) =>
+          @installPackage pkg, (error) ->
+            # installation of package finished
+            notifications[pkg.name].dismiss()
+            delete notifications[pkg.name]
+            if error?
+              failed.push(pkg.name)
+              atom.notifications.addWarning "Sync-settings: failed to install #{pkg.name}"
+            else
+              succeeded.push(pkg.name)
+            # trigger next package
+            installNextPackage()
+      else if Object.keys(notifications).length is 0
+        # last package installation finished
+        if failed.length is 0
+          atom.notifications.addSuccess "Sync-settings: finished installing #{succeeded.length} packages"
+        else
+          failed.sort()
+          failedStr = failed.join(', ')
+          atom.notifications.addWarning "Sync-settings: finished installing packages (#{failed.length} failed: #{failedStr})", {dismissable: true}
+        cb?()
+    # start as many package installations in parallel as desired
+    concurrency = Math.min missing_packages.length, 8
+    for i in [0...concurrency]
+      installNextPackage()
 
   installPackage: (pack, cb) ->
     type = if pack.theme then 'theme' else 'package'
@@ -320,10 +441,9 @@ SyncSettings =
     @inputView.setCallbackInstance(this)
 
   forkGistId: (forkId) ->
-    @tracker.track 'Fork'
     @createClient().gists.fork
       id: forkId
-    , (err, res) =>
+    , (err, res) ->
       if err
         try
           message = JSON.parse(err.message).message
